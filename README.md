@@ -443,27 +443,7 @@ O MariaDB pode fazer o cálculo dentro do banco de dados em uma única instruç�
 Atualização Atômica
 ```php
 $updated = Livro::where('id', $livroId)
-    ->where('available_copi<?php
-
-namespace Tests\Feature;
-
-use Illuminate\Foundation\Testing\RefreshDatabase;
-use Illuminate\Foundation\Testing\WithFaker;
-use Tests\TestCase;
-
-class DevolucaoTest extends TestCase
-{
-    /**
-     * A basic feature test example.
-     */
-    public function test_example(): void
-    {
-        $response = $this->get('/');
-
-        $response->assertStatus(200);
-    }
-}
-es', '>=', 1)
+    ->where('available_copies', '>=', 1)
     ->decrement('available_copies');
 
 if ($updated === 0) {
