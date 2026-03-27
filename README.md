@@ -298,6 +298,10 @@ Se não aparecer, instale‑a:
 ```bash
 sudo apt install php8.4-pcntl
 ```
+O Laravel exige o pacote spatie/fork para usar o driver fork da facade Concurrency. Basta instalá-lo como dependência de desenvolvimento:
+```bash
+composer require spatie/fork --dev
+```
 Criando o teste
 
 ```bash
