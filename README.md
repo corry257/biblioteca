@@ -70,6 +70,29 @@ Crie o banco de dados (se necessário):
 ```bash
 mariadb -u root -p -e "CREATE DATABASE biblioteca;"
 ```
+
+## Ambiente de Testes (importante!)
+
+Para isolar os testes e garantir que não interfiram no banco de desenvolvimento, vamos criar um arquivo .env.testing:
+```bash
+cp .env .env.testing
+```
+Edite .env.testing e altere o nome do banco de dados:
+```env
+DB_DATABASE=biblioteca_testing
+```
+Agora crie o banco de testes:
+```bash
+mariadb -u root -p -e "CREATE DATABASE biblioteca_testing;"
+```
+Também precisamos garantir que o PHPUnit utilize esse ambiente. O arquivo phpunit.xml na raiz do projeto pode conter linhas que forçam o uso de SQLite. Comente ou remova as linhas que definem DB_CONNECTION e DB_DATABASE dentro da seção <php>, para que o ambiente do .env.testing seja respeitado:
+```xml
+<php>
+    <!-- <env name="DB_CONNECTION" value="sqlite"/> -->
+    <!-- <env name="DB_DATABASE" value=":memory:"/> -->
+    ...
+</php>
+```
 ## Criando os Models
 Vamos construir um sistema simples com três entidades: livros, usuários e empréstimos.
 
@@ -230,14 +253,52 @@ class EmprestimoController extends Controller
     }
 }
 ```
-Adicione a rota em routes/api.php:
+## Rotas da API
+
+Precisamos registrar a rota. Em projetos Laravel 11+, as rotas de API são definidas no arquivo routes/api.php. Certifique-se de que o arquivo exista e contenha:
 
 ```php
+<?php
+
+use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\EmprestimoController;
+
 Route::post('/emprestar', [EmprestimoController::class, 'emprestar']);
 ```
 
+Além disso, no arquivo bootstrap/app.php, a linha api: __DIR__.'/../routes/api.php', deve estar presente dentro do método withRouting. Caso não esteja, adicione‑a:
+
+```php
+->withRouting(
+    web: __DIR__.'/../routes/web.php',
+    commands: __DIR__.'/../routes/console.php',
+    api: __DIR__.'/../routes/api.php',  // <-- esta linha
+    health: '/up',
+)
+```
+
+Para verificar se a rota foi registrada, execute:
+
+```bash
+php artisan route:list --env=testing | grep emprestar
+```
+
+Deverá aparecer: POST api/emprestar ......... EmprestimoController@emprestar
+
 ## Simulando Carga Concorrente: O Teste que Quebra
-Crie um teste para simular 10 usuários tentando pegar o último exemplar simultaneamente:
+Para reproduzir a condição de corrida, precisamos executar várias requisições simultaneamente. O simples uso de um foreach com postJson não é suficiente, pois as requisições são sequenciais. Vamos usar a fachada Concurrency do Laravel com o driver fork, que cria processos PHP separados, executando as chamadas ao controlador em paralelo.   
+     
+Instalando e ativando a extensão pcntl (necessária para o fork)
+
+A extensão pcntl geralmente já vem com o PHP, mas pode ser necessário ativá‑la. Verifique se está habilitada:
+```bash
+php -m | grep pcntl
+```
+Se não aparecer, instale‑a:
+```bash
+sudo apt install php8.4-pcntl
+```
+Criando o teste
 
 ```bash
 php artisan make:test EmprestimoConcurrencyTest
@@ -251,57 +312,77 @@ use Tests\TestCase;
 use App\Models\Livro;
 use App\Models\Loan;
 use App\Models\User;
-use Illuminate\Foundation\Testing\RefreshDatabase;
+use App\Http\Controllers\EmprestimoController;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Concurrency;
+use Illuminate\Support\Facades\DB;
 
 class EmprestimoConcurrencyTest extends TestCase
 {
-    use RefreshDatabase;
-
     public function test_concurrent_emprestimo_reveals_race_condition()
     {
-        // Cria um livro com 1 exemplar
+        // 1. Limpa o banco de testes e executa as migrations
+        $this->artisan('migrate:fresh', ['--env' => 'testing'])->run();
+
+        // 2. Cria um livro com 1 exemplar
         $livro = Livro::create([
             'titulo' => 'Livro Único',
             'autor' => 'Autor Exemplo',
             'ano' => 2020,
             'isbn' => 1234567890,
             'total_copies' => 1,
-            'available_copies' => 1
+            'available_copies' => 1,
         ]);
 
-        // Cria 10 usuários
-        $users = User::factory(10)->create();
+        // 3. Cria 10 usuários
+        $users = User::factory(10)->create(['has_fine' => false]);
 
-        // Simula 10 requisições concorrentes
-        $responses = [];
+        // 4. Prepara as tarefas (cada uma chama o controlador)
+        $tasks = [];
         foreach ($users as $user) {
-            $responses[] = $this->postJson('/api/emprestar', [
-                'user_id' => $user->id,
-                'livro_id' => $livro->id
-            ]);
+            $tasks[] = function () use ($user, $livro) {
+                // Cada processo filho precisa de uma conexão própria
+                DB::reconnect();
+
+                $request = new Request([
+                    'user_id' => $user->id,
+                    'livro_id' => $livro->id,
+                ]);
+
+                $controller = new EmprestimoController();
+                $response = $controller->emprestar($request);
+
+                return [
+                    'status' => $response->status(),
+                    'data'   => $response->getData(true),
+                ];
+            };
         }
 
-        // Conta sucessos e falhas
-        $successCount = collect($responses)->filter(fn($r) => $r->status() === 200)->count();
-        $failureCount = collect($responses)->filter(fn($r) => $r->status() === 400)->count();
+        // 5. Executa em paralelo usando o driver 'fork'
+        $results = Concurrency::driver('fork')->run($tasks);
+
+        // 6. Conta sucessos e falhas
+        $successCount = collect($results)->filter(fn($r) => $r['status'] === 200)->count();
+        $failureCount = collect($results)->filter(fn($r) => $r['status'] === 400)->count();
 
         dump('=== RESULTADOS DA CONDIÇÃO DE CORRIDA ===');
-        dump('Empréstimos bem‑sucedidos: ' . $successCount);
-        dump('Falhas: ' . $failureCount);
+        dump("Empréstimos bem‑sucedidos: $successCount");
+        dump("Falhas: $failureCount");
 
         $livro->refresh();
-        dump('Estoque restante: ' . $livro->available_copies);
-
+        dump("Estoque restante: " . $livro->available_copies);
         $loanCount = Loan::where('livro_id', $livro->id)->count();
-        dump('Empréstimos registrados: ' . $loanCount);
+        dump("Empréstimos registrados: $loanCount");
 
-        // Estas asserções vão FALHAR!
+        // Essas asserções vão falhar se houver race condition (muitos sucessos)
         $this->assertEquals(1, $successCount);
         $this->assertEquals(9, $failureCount);
         $this->assertEquals(0, $livro->available_copies);
     }
 }
 ```
+
 Execute o teste:
 
 ```bash
@@ -315,19 +396,22 @@ Empréstimos bem‑sucedidos: 10
 Falhas: 0
 Estoque restante: 0
 Empréstimos registrados: 10
-Criamos 10 empréstimos para 1 exemplar! O estoque foi para negativo e múltiplos usuários pegaram o mesmo livro – tudo sem nenhum erro registrado.
 ```
+Criamos 10 empréstimos para 1 exemplar! O estoque foi para negativo e múltiplos usuários pegaram o mesmo livro – tudo sem nenhum erro registrado.
+   
+*Observação: Em alguns ambientes, o teste pode passar mesmo sem o usleep, mas para forçar a condição de corrida, você pode adicionar um pequeno atraso no controlador (usleep(200000)) após a verificação do estoque, antes de decrementar. Isso simula um processamento mais lento e aumenta a janela de concorrência.*
+
 ### Entendendo o Que Aconteceu
 Quando duas requisições chegam quase ao mesmo tempo:
    
-Tempo	Requisição A (User 1)	Requisição B (User 2)	Banco (available_copies)   
-t1	SELECT * FROM livros WHERE id = 1		1   
-t2		SELECT * FROM livros WHERE id = 1	1   
-t3	Verifica: available_copies >= 1 ✓		1   
-t4		Verifica: available_copies >= 1 ✓	1   
-t5	UPDATE ... SET available_copies = 0		0   
-t6		UPDATE ... SET available_copies = 0	0   
-t7	Cria empréstimo	Cria empréstimo	2 empréstimos  
+|Tempo | Requisição A (User 1) | Requisição B (User 2) | Banco (available_copies)|   
+|t1	| SELECT * FROM livros WHERE id = 1	|	1   |
+|t2	|	|SELECT * FROM livros WHERE id = 1|	1   |
+|t3	|Verifica: available_copies >= 1 ✓	|	1   |
+|t4	|	|Verifica: available_copies >= 1 ✓|	1   |
+|t5	|UPDATE ... SET available_copies = 0|		|0|   
+|t6	|	|UPDATE ... SET available_copies = 0	|0 |  
+|t7	|Cria empréstimo	|Cria empréstimo|	2 empréstimos  
    
 Ambas as requisições leram o mesmo estado (1 exemplar) antes que qualquer uma escrevesse. O resultado: duas operações de empréstimo para um único exemplar.   
    
@@ -360,7 +444,7 @@ $updated = Livro::where('id', $livroId)
 ```
 O que isso faz? O banco de dados executa a leitura, a verificação e a escrita em um único passo atômico. Se duas requisições executarem isso ao mesmo tempo, apenas uma vai conseguir fazer a atualização; a outra não encontrará available_copies >= 1 e retornará 0.
    
-O Controlador Corrigido
+O Controller Corrigido
 ```php
 <?php
 
@@ -414,58 +498,12 @@ class EmprestimoController extends Controller
 }
 ```
 ## Testando a Solução Atômica
-Atualize o teste para usar o mesmo método:
-
-```php
-public function test_atomic_operations_prevent_race_conditions()
-{
-    // Cria um livro com 1 exemplar
-    $livro = Livro::create([
-        'titulo' => 'Livro Único',
-        'autor' => 'Autor Exemplo',
-        'ano' => 2020,
-        'isbn' => 1234567890,
-        'total_copies' => 1,
-        'available_copies' => 1
-    ]);
-
-    // Cria 10 usuários
-    $users = User::factory(10)->create();
-
-    // Simula 10 requisições concorrentes
-    $responses = [];
-    foreach ($users as $user) {
-        $responses[] = $this->postJson('/api/emprestar', [
-            'user_id' => $user->id,
-            'livro_id' => $livro->id
-        ]);
-    }
-
-    $successCount = collect($responses)->filter(fn($r) => $r->status() === 200)->count();
-    $failureCount = collect($responses)->filter(fn($r) => $r->status() === 400)->count();
-
-    dump('=== RESULTADOS COM OPERAÇÕES ATÔMICAS ===');
-    dump('Empréstimos bem‑sucedidos: ' . $successCount);
-    dump('Falhas: ' . $failureCount);
-
-    $livro->refresh();
-    dump('Estoque restante: ' . $livro->available_copies);
-
-    $loanCount = Loan::where('livro_id', $livro->id)->count();
-    dump('Empréstimos registrados: ' . $loanCount);
-
-    $this->assertEquals(1, $successCount);
-    $this->assertEquals(9, $failureCount);
-    $this->assertEquals(0, $livro->available_copies);
-    $this->assertEquals(1, $loanCount);
-}
-```
-Execute:
+Após aplicar a correção no controlador, execute novamente o mesmo teste concorrente:
 
 ```bash
 php artisan test --filter=test_atomic_operations_prevent_race_conditions
 ```
-Resultado:
+Resultado esperado:
 
 ```text
 === RESULTADOS COM OPERAÇÕES ATÔMICAS ===
@@ -476,8 +514,9 @@ Empréstimos registrados: 1
 
 PASS  Tests\Feature\EmprestimoConcurrencyTest
 ✓ atomic operations prevent race conditions
-Perfeito! Apenas um usuário conseguiu o livro, nove receberam erro de indisponibilidade.
 ```
+Perfeito! Apenas um usuário conseguiu o livro, nove receberam erro de indisponibilidade.
+
 # Operações Multi-Tabela: Transações com Bloqueio
 E quando precisamos atualizar múltiplas tabelas de forma consistente? Por exemplo, na devolução de um livro, precisamos:
 
@@ -584,12 +623,12 @@ As operações atômicas são não apenas mais seguras, mas também mais rápida
 # Boas Práticas
 1. Use atualizações atômicas para modificações numéricas
 ```php
-// ✅ BOM
+// BOM
 Livro::where('id', $id)
     ->where('available_copies', '>=', 1)
     ->update(['available_copies' => DB::raw('available_copies - 1')]);
 
-// ❌ RUIM
+// RUIM
 $livro = Livro::find($id);
 $livro->available_copies -= 1;
 $livro->save();
@@ -614,11 +653,11 @@ DB::transaction(function () {
 ```
 4. Saiba quando usar Eloquent
 ```php
-// ✅ Bom para inserções e leituras
+// Bom para inserções e leituras
 $livro = Livro::create([...]);
 $livros = Livro::all();
 
-// ✅ Bom para atualizações independentes
+// Bom para atualizações independentes
 Livro::where('id', $id)->update(['status' => 'inativo']);
 ```
 ## Quando Usar Cada Abordagem
