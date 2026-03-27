@@ -420,14 +420,14 @@ Criamos 10 empréstimos para 1 exemplar! O estoque foi para negativo e múltiplo
 ### Entendendo o Que Aconteceu
 Quando duas requisições chegam quase ao mesmo tempo:
    
-|Tempo | Requisição A (User 1) | Requisição B (User 2) | Banco (available_copies)|   
-|t1	| SELECT * FROM livros WHERE id = 1	|	1   |
-|t2	|	|SELECT * FROM livros WHERE id = 1|	1   |
-|t3	|Verifica: available_copies >= 1 ✓	|	1   |
-|t4	|	|Verifica: available_copies >= 1 ✓|	1   |
-|t5	|UPDATE ... SET available_copies = 0|		|0|   
-|t6	|	|UPDATE ... SET available_copies = 0	|0 |  
-|t7	|Cria empréstimo	|Cria empréstimo|	2 empréstimos  
+Tempo  Requisição A (User 1) | Requisição B (User 2) | Banco (available_copies)|   
+t1	 SELECT * FROM livros WHERE id = 1		1   
+t2		|SELECT * FROM livros WHERE id = 1	1   
+t3	Verifica: available_copies >= 1 ✓		1   
+t4		|Verifica: available_copies >= 1 ✓	1   
+t5	UPDATE ... SET available_copies = 0		0   
+t6		|UPDATE ... SET available_copies = 0	0   
+t7	Cria empréstimo	Cria empréstimo	2 empréstimos  
    
 Ambas as requisições leram o mesmo estado (1 exemplar) antes que qualquer uma escrevesse. O resultado: duas operações de empréstimo para um único exemplar.   
    
@@ -454,9 +454,11 @@ Atualização Atômica
 ```php
 $updated = Livro::where('id', $livroId)
     ->where('available_copies', '>=', 1)
-    ->update([
-        'available_copies' => DB::raw('available_copies - 1')
-    ]);
+    ->decrement('available_copies');
+
+if ($updated === 0) {
+    return response()->json(['error' => 'Livro não disponível'], 400);
+}
 ```
 O que isso faz? O banco de dados executa a leitura, a verificação e a escrita em um único passo atômico. Se duas requisições executarem isso ao mesmo tempo, apenas uma vai conseguir fazer a atualização; a outra não encontrará available_copies >= 1 e retornará 0.
    
@@ -484,18 +486,16 @@ class EmprestimoController extends Controller
         $userId = $request->user_id;
         $livroId = $request->livro_id;
 
-        // Verifica multa (operação simples, sem atomicidade crítica)
+        // Verifica multa
         $user = User::find($userId);
         if ($user->has_fine) {
             return response()->json(['error' => 'Usuário com multa pendente'], 400);
         }
 
-        // OPERAÇÃO ATÔMICA: diminui available_copies se houver pelo menos 1
+        // Operação atômica: decrementa se houver estoque
         $updated = Livro::where('id', $livroId)
             ->where('available_copies', '>=', 1)
-            ->update([
-                'available_copies' => DB::raw('available_copies - 1')
-            ]);
+            ->decrement('available_copies');
 
         if ($updated === 0) {
             return response()->json(['error' => 'Livro não disponível'], 400);
@@ -527,9 +527,6 @@ Empréstimos bem‑sucedidos: 1
 Falhas: 9
 Estoque restante: 0
 Empréstimos registrados: 1
-
-PASS  Tests\Feature\EmprestimoConcurrencyTest
-✓ atomic operations prevent race conditions
 ```
 Perfeito! Apenas um usuário conseguiu o livro, nove receberam erro de indisponibilidade.
 
