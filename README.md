@@ -386,6 +386,20 @@ class EmprestimoConcurrencyTest extends TestCase
     }
 }
 ```
+*Nota sobre concorrência no MariaDB:
+Em alguns ambientes, o MariaDB pode ser rápido demais e o teste pode não reproduzir a condição de corrida. Para forçá‑la, adicione temporariamente um usleep(200000) no controller após a verificação do estoque. Isso cria uma pequena janela de tempo para que os processos concorrentes leiam o mesmo estado. Após comprovar o problema, remova o usleep antes de aplicar a correção atômica.*
+```php
+// ... dentro do método emprestar
+$livro = Livro::find($livroId);
+if ($livro->available_copies < 1) {
+    return response()->json(['error' => 'Sem exemplares disponíveis'], 400);
+}
+
+usleep(200000); // 0,2 segundos – simula processamento lento
+
+$livro->available_copies -= 1;
+$livro->save();
+```
 
 Execute o teste:
 
@@ -402,8 +416,6 @@ Estoque restante: 0
 Empréstimos registrados: 10
 ```
 Criamos 10 empréstimos para 1 exemplar! O estoque foi para negativo e múltiplos usuários pegaram o mesmo livro – tudo sem nenhum erro registrado.
-   
-*Observação: Em alguns ambientes, o teste pode passar mesmo sem o usleep, mas para forçar a condição de corrida, você pode adicionar um pequeno atraso no controlador (usleep(200000)) após a verificação do estoque, antes de decrementar. Isso simula um processamento mais lento e aumenta a janela de concorrência.*
 
 ### Entendendo o Que Aconteceu
 Quando duas requisições chegam quase ao mesmo tempo:
